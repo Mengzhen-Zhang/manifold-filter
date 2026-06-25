@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+nalgebra = { version = "0.35" }
+num-dual = { version = "0.14.1" }
+num-traits = { version = "0.2.19" }
