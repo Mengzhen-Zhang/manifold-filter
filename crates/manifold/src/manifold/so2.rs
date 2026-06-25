@@ -51,4 +51,12 @@ impl Manifold<f64, 2, 1> for ComplexRotation {
     fn tangent_to_vector(tangent: &Self::TangentVector) -> SVector<f64, 1> {
         SVector::<f64, 1>::new(*tangent)
     }
+
+    fn from_ambient(vec: &SVector<f64, 2>) -> Self {
+	Self { z: *vec }
+    }
+
+    fn to_ambient(&self) -> SVector<f64, 2> {
+	self.z
+    }
 }

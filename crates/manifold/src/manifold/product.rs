@@ -76,4 +76,21 @@ where
         vec.fixed_rows_mut::<T2>(T1).copy_from(&M2::tangent_to_vector(&tangent.1));
         vec
     }
+
+    #[inline]
+    fn from_ambient(vec: &SVector<S, A_TOTAL>) -> Self {
+	let v1 = vec.fixed_rows::<A1>(0).into_owned();
+	let v2 = vec.fixed_rows::<A2>(A1).into_owned();
+	ProductSpace {
+	    m1: M1::from_ambient(&v1),
+	    m2: M2::from_ambient(&v2),
+	}
+    }
+
+    fn to_ambient(&self) -> SVector<S, A_TOTAL> {
+	let mut vec = SVector::<S, A_TOTAL>::zeros();
+	vec.fixed_rows_mut::<A1>(0).copy_from(&self.m1.to_ambient());
+	vec.fixed_rows_mut::<A2>(A1).copy_from(&self.m2.to_ambient());
+	vec
+    }
 }

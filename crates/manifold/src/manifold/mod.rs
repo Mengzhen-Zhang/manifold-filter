@@ -11,6 +11,12 @@ pub use rn::*;
 pub mod so2;
 pub use so2::*;
 
+pub mod so3;
+pub use so3::*;
+
+pub mod dynamics;
+pub use dynamics::*;
+
 pub trait Manifold<S, const A_DIM: usize, const T_DIM: usize> {
     type TangentVector;
 
@@ -29,6 +35,10 @@ pub trait Manifold<S, const A_DIM: usize, const T_DIM: usize> {
     fn vector_to_tangent(vec: &SVector<S, T_DIM>) -> Self::TangentVector;
 
     fn tangent_to_vector(tangent: &Self::TangentVector) -> SVector<S, T_DIM>;
+
+    fn from_ambient(vec: &SVector<S, A_DIM>) -> Self;
+
+    fn to_ambient(&self) -> SVector<S, A_DIM>;
 }
 
 pub trait InvariantLieGroup<S, const A_DIM: usize, const T_DIM: usize>: Manifold<S, A_DIM, T_DIM> {
@@ -49,22 +59,6 @@ pub trait InvariantLieGroup<S, const A_DIM: usize, const T_DIM: usize>: Manifold
 
     // ad_omega
     fn small_adjoint(omega: &Self::TangentVector) -> SMatrix<S, T_DIM, T_DIM>;
-}
-
-pub trait TimeVaryingConstraint<S, const A_DIM: usize, const T_DIM: usize, const C_DIM: usize> {
-    /// The user implements the math using a raw function pointer or closure wrapped by your Diff engines
-    fn constraint_engine(&self) -> &impl Diff<S, A_DIM, C_DIM>;
-
-    #[inline(always)]
-    fn evaluate(&self, ambient_state: &SVector<S, A_DIM>) -> SVector<S, C_DIM> {
-        self.constraint_engine().eval(ambient_state)
-    }
-
-    /// Evaluates the explicit ambient Jacobian matrix H_ambient (C_DIM x A_DIM)
-    #[inline(always)]
-    fn ambient_jacobian(&self, ambient_state: &SVector<S, A_DIM>) -> SMatrix<S, C_DIM, A_DIM> {
-        self.constraint_engine().jacobian(ambient_state)
-    }
 }
 
 impl InvariantLieGroup<f64, 2, 1> for ComplexRotation {
@@ -100,36 +94,6 @@ mod integration_tests {
     use nalgebra::{Vector1, Vector2, Vector3, SMatrix};
 
     use super::*;
-    use crate::dual::Dual;
-    use crate::diff::{AutoDiff, Diff}; // Assuming AutoDiff is exposed in your diff module
-
-    // -------------------------------------------------------------------------
-    // 1. Defining a Concrete Constraint using your AutoDiff Engine
-    // Let's constrain our RealLine state to sit on a moving boundary:
-    // h(x, t) = x - 2.0 * t = 0
-    // -------------------------------------------------------------------------
-    pub struct MovingBoundaryConstraint {
-        engine: AutoDiff<f64, 1, 1>,
-    }
-
-    impl MovingBoundaryConstraint {
-        pub fn new() -> Self {
-            // Function signature matching your AutoDiff framework: f(x, y)
-            fn constraint_formula(x: &SVector<Dual<f64>, 1>, y: &mut SVector<Dual<f64>, 1>) {
-                // Fixed target position at 5.0 for this simple snapshot test
-                y[0] = x[0] - Dual::from_re(5.0); 
-            }
-            Self {
-                engine: AutoDiff::new(constraint_formula),
-            }
-        }
-    }
-
-    impl TimeVaryingConstraint<f64, 1, 1, 1> for MovingBoundaryConstraint {
-        fn constraint_engine(&self) -> &impl Diff<f64, 1, 1> {
-            &self.engine
-        }
-    }
 
     // -------------------------------------------------------------------------
     // 2. Running Test Cases
@@ -182,19 +146,5 @@ mod integration_tests {
         // Real Line slice: [-3.0]
         assert_eq!(ambient_vel, Vector3::new(0.0, 2.0, -3.0));
     }
-
-    #[test]
-    fn test_autodiff_constraint_bridge() {
-        let constraint = MovingBoundaryConstraint::new();
-        let line_state = RealLine { x: Vector1::new(7.0) };
-
-        // Evaluate residual: 7.0 - 5.0 = 2.0
-        let residual = constraint.evaluate(&line_state.x);
-        assert_eq!(residual, Vector1::new(2.0));
-
-        // Evaluate AutoDiff Jacobian: d/dx (x - 5) = 1.0
-        let h_ambient = constraint.ambient_jacobian(&line_state.x);
-
-        assert_eq!(h_ambient, SMatrix::<f64, 1, 1>::new(1.0));
-    }
+    
 }

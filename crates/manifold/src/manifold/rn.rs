@@ -32,4 +32,12 @@ impl Manifold<f64, 1, 1> for RealLine {
     fn tangent_to_vector(tangent: &Self::TangentVector) -> SVector<f64, 1> {
         SVector::<f64, 1>::new(*tangent)
     }
+
+    fn from_ambient(vec: &SVector<f64, 1>) -> Self {
+	Self { x: *vec }
+    }
+
+    fn to_ambient(&self) -> SVector<f64, 1> {
+	self.x
+    }
 }
