@@ -26,3 +26,4 @@ Cargo.lock
 .eglot/
 .rust-analyzer/
 .cache/
+.claude/
