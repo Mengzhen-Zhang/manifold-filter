@@ -2,4 +2,7 @@
 
 pub mod diff;
 pub mod manifold;
-pub mod dual;
+
+// `dual` now lives in its own crate; re-export it so `crate::dual::Dual` and
+// `manifold::dual::Dual` continue to resolve.
+pub use dual;
