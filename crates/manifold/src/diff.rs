@@ -1,10 +1,9 @@
-use crate::dual::Dual;
+use crate::dual::{self, Dual};
 use nalgebra::{RealField, SMatrix, SVector};
-use num_traits::{One, Zero};
 
 pub trait Diff<T, const In: usize, const Out: usize> {
     fn eval(&self, x: &SVector<T, In>) -> SVector<T, Out>;
-    
+
     fn jacobian(&self, x: &SVector<T, In>) -> SMatrix<T, Out, In>;
 
     // jacobian vector product
@@ -12,75 +11,63 @@ pub trait Diff<T, const In: usize, const Out: usize> {
     fn eval_jvp(&self, x: &SVector<T, In>, v: &SVector<T, In>) -> (SVector<T, Out>, SVector<T, Out>);
 }
 
-pub struct AutoDiff<T, const I: usize, const O: usize>
-{
-    pub f: fn(&SVector<Dual<T>, I>, &mut SVector<Dual<T>, O>)
+/// A function written generically over the scalar field. Instantiating it at
+/// different scalars yields different modes from a single definition:
+/// `S = T` is a plain value evaluation (no AD), `S = Dual<T, In>` produces the
+/// full batched Jacobian in one pass, and `S = Dual<T, 1>` gives a single
+/// directional derivative.
+pub trait DiffFn<const In: usize, const Out: usize> {
+    fn eval<S: RealField + Copy>(&self, x: &SVector<S, In>, y: &mut SVector<S, Out>);
 }
 
-impl<T, const I: usize, const O: usize> AutoDiff<T, I, O> {
-    pub fn new(f: fn(&SVector<Dual<T>, I>, &mut SVector<Dual<T>, O>)) -> Self {
+pub struct AutoDiff<G> {
+    pub f: G,
+}
+
+impl<G> AutoDiff<G> {
+    pub fn new(f: G) -> Self {
 	Self { f }
     }
 }
 
-#[inline]
-fn dual_zeros<T: RealField + From<f32>, const Out: usize>() -> SVector::<Dual<T>, Out> {
-    SVector::<Dual<T>, Out>::from_element(Dual::<T>::from_re(T::from(0.0)))
-}
-
-impl<T: RealField + From<f32>, const In: usize, const Out: usize> Diff<T, In, Out> for AutoDiff<T, In, Out> {
+impl<T, G, const In: usize, const Out: usize> Diff<T, In, Out> for AutoDiff<G>
+where
+    T: RealField + Copy,
+    G: DiffFn<In, Out>,
+{
     fn eval(&self, x: &SVector<T, In>) -> SVector<T, Out> {
-	let x_dual = x.map(|v| Dual::<T>::from_re(v));
-	let mut y_dual = dual_zeros::<T, Out>();
-	(self.f)(&x_dual, &mut y_dual);
-	y_dual.map(|x| x.re)
+	// Runs on plain reals: no dual numbers, no AD overhead.
+	let mut y = SVector::<T, Out>::zeros();
+	self.f.eval::<T>(x, &mut y);
+	y
     }
 
     fn jacobian(&self, x: &SVector<T, In>) -> SMatrix<T, Out, In> {
-	let mut j = SMatrix::<T, Out, In>::zeros();
-	let mut x_dual = x.map(|v| Dual::<T>::from_re(v));
-	let mut y_dual_buffer = dual_zeros::<T,Out>();
-
-	for i in 0..In {
-	    x_dual[i].eps = T::one();
-	    
-	    (self.f)(&x_dual, &mut y_dual_buffer);
-	    
-	    j.column_mut(i)
-		.copy_from(&y_dual_buffer.map(|y| y.eps));
-
-	    x_dual[i].eps = T::zero();
-	};
-
-	j
+	// Seed every input with its unit tangent and evaluate once: a single
+	// width-In pass yields the whole Out x In Jacobian.
+	let x_dual = dual::seeded(x);
+	let mut y_dual = SVector::<Dual<T, In>, Out>::zeros();
+	self.f.eval::<Dual<T, In>>(&x_dual, &mut y_dual);
+	dual::jacobian(&y_dual)
     }
 
     fn jvp(&self, x: &SVector<T, In>, v: &SVector<T, In>) -> SVector<T, Out> {
-	let x_dual = x
-	    .zip_map(v, |a,b| {
-		Dual::<T>::new(a, b)
-	    });
-
-        let mut y_dual_buffer = dual_zeros::<T, Out>();
-
-	(self.f)(&x_dual, &mut y_dual_buffer);
-
-	let jvp = y_dual_buffer.map(|y| y.eps);
-	jvp
+	// Single direction: a width-1 dual seeded with the tangent `v` gives
+	// J*v directly in one cheap pass (cost independent of In).
+	let x_dual =
+	    SVector::<Dual<T, 1>, In>::from_fn(|i, _| Dual::new(x[i], SVector::<T, 1>::new(v[i])));
+	let mut y_dual = SVector::<Dual<T, 1>, Out>::zeros();
+	self.f.eval::<Dual<T, 1>>(&x_dual, &mut y_dual);
+	y_dual.map(|d| d.eps[0])
     }
 
     fn eval_jvp(&self, x: &SVector<T, In>, v: &SVector<T, In>) -> (SVector<T, Out>, SVector<T, Out>) {
-	let x_dual = x
-	    .zip_map(v, |a,b| {
-		Dual::<T>::new(a, b)
-	    });
-	let mut y_dual_buffer = dual_zeros::<T, Out>();
-
-	(self.f)(&x_dual, &mut y_dual_buffer);
-	let y = y_dual_buffer.map(|y| y.re);
-	let jvp = y_dual_buffer.map(|y| y.eps);
-
-	(y, jvp)
+	// Value and directional derivative from the same width-1 pass.
+	let x_dual =
+	    SVector::<Dual<T, 1>, In>::from_fn(|i, _| Dual::new(x[i], SVector::<T, 1>::new(v[i])));
+	let mut y_dual = SVector::<Dual<T, 1>, Out>::zeros();
+	self.f.eval::<Dual<T, 1>>(&x_dual, &mut y_dual);
+	(y_dual.map(|d| d.re), y_dual.map(|d| d.eps[0]))
     }
 }
 
@@ -126,6 +113,12 @@ mod tests {
     use super::*;
     use nalgebra::{Vector2, Matrix2};
 
+    // Builds a generic scalar constant from an f64 literal.
+    #[inline]
+    fn c<S: RealField>(x: f64) -> S {
+        nalgebra::convert(x)
+    }
+
     // -------------------------------------------------------------------------
     // Test Case 1: Simple Linear/Affine Transformation Matrix
     // f(x, y) = [2x + 3y, 4x - y]
@@ -133,9 +126,12 @@ mod tests {
     // [2.0,  3.0]
     // [4.0, -1.0]
     // -------------------------------------------------------------------------
-    fn linear_test_func_autodiff(x: &SVector<Dual<f64>, 2>, y: &mut SVector<Dual<f64>, 2>) {
-        y[0] = x[0] * 2.0 + x[1] * 3.0;
-        y[1] = x[0] * 4.0 - x[1];
+    struct LinearFn;
+    impl DiffFn<2, 2> for LinearFn {
+        fn eval<S: RealField + Copy>(&self, x: &SVector<S, 2>, y: &mut SVector<S, 2>) {
+            y[0] = x[0] * c(2.0) + x[1] * c(3.0);
+            y[1] = x[0] * c(4.0) - x[1];
+        }
     }
 
     fn linear_test_func_normal(x: &SVector<f64, 2>) -> SVector<f64, 2> {
@@ -149,7 +145,7 @@ mod tests {
 
     #[test]
     fn test_linear_autodiff() {
-        let ad = AutoDiff::new(linear_test_func_autodiff);
+        let ad = AutoDiff::new(LinearFn);
         let x = Vector2::new(1.0, 2.0); // Evaluation point
         let v = Vector2::new(10.0, -1.0); // Direction vector
 
@@ -196,24 +192,27 @@ mod tests {
     // [2x,   0]
     // [y,    x]
     // -------------------------------------------------------------------------
-    fn nonlinear_test_func_autodiff(x: &SVector<Dual<f64>, 2>, y: &mut SVector<Dual<f64>, 2>) {
-        y[0] = x[0] * x[0];       // x^2
-        y[1] = x[0] * x[1];       // x * y
+    struct NonlinearFn;
+    impl DiffFn<2, 2> for NonlinearFn {
+        fn eval<S: RealField + Copy>(&self, x: &SVector<S, 2>, y: &mut SVector<S, 2>) {
+            y[0] = x[0] * x[0];       // x^2
+            y[1] = x[0] * x[1];       // x * y
+        }
     }
 
     #[test]
     fn test_nonlinear_autodiff() {
-        let ad = AutoDiff::new(nonlinear_test_func_autodiff);
+        let ad = AutoDiff::new(NonlinearFn);
         let x = Vector2::new(3.0, 4.0);  // Evaluate at x=3, y=4
         let v = Vector2::new(2.0, 5.0);  // Direction vector
 
         // f(3, 4) = [9, 12)
         let expected_eval = Vector2::new(9.0, 12.0);
-        
+
         // J = [[6, 0), [4, 3))
         let expected_jac = Matrix2::new(6.0, 0.0,
                                    4.0, 3.0);
-        
+
         // J * v = [[6, 0), [4, 3)) * [2, 5) = [12, 4 * 2 + 3 * 5) = [12, 23)
         let expected_jvp = Vector2::new(12.0, 23.0);
 
@@ -231,7 +230,7 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn test_polymorphism() {
-	let ad = AutoDiff::new(linear_test_func_autodiff);
+	let ad = AutoDiff::new(LinearFn);
 	let nd = NormalDiff::new(
             linear_test_func_normal,
             linear_test_jacobian_normal,

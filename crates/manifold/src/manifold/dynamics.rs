@@ -120,12 +120,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::{TrajectoryDynamics, TimeVaryingConstraint};
-    use crate::diff::{NormalDiff, AutoDiff};
-    use crate::dual::Dual;
+    use crate::diff::{NormalDiff, AutoDiff, DiffFn};
     use crate::manifold::{ComplexRotation, RealLine, Manifold};
-    use nalgebra::{SVector, SMatrix};
+    use nalgebra::{RealField, SVector, SMatrix};
 
     const EPS: f64 = 1e-9;
+
+    // Builds a generic scalar constant from an f64 literal.
+    #[inline]
+    fn c<S: RealField>(x: f64) -> S {
+        nalgebra::convert(x)
+    }
 
     // =========================================================================
     // Fixtures: closed-form dynamics / constraint functions used by the engines.
@@ -152,8 +157,11 @@ mod tests {
 
     // Nonlinear velocity for the AutoDiff path, packed input = [z0, z1, u, w].
     //   f = z0^2 + 3u + 4w   =>  J = [2*z0, 0, 3, 4]
-    fn nonlinear_vel_ad(p: &SVector<Dual<f64>, 4>, y: &mut SVector<Dual<f64>, 1>) {
-        y[0] = p[0] * p[0] + p[2] * 3.0 + p[3] * 4.0;
+    struct NonlinearVelAd;
+    impl DiffFn<4, 1> for NonlinearVelAd {
+        fn eval<S: RealField + Copy>(&self, p: &SVector<S, 4>, y: &mut SVector<S, 1>) {
+            y[0] = p[0] * p[0] + p[2] * c(3.0) + p[3] * c(4.0);
+        }
     }
 
     // Unit-norm constraint on the ambient circle:  h(z) = z0^2 + z1^2 - 1
@@ -276,8 +284,8 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn test_linearize_autodiff_rotation() {
-        let sys: TrajectoryDynamics<f64, AutoDiff<f64, 4, 1>, 2, 1, 1, 1, 4> =
-            TrajectoryDynamics::new(AutoDiff::new(nonlinear_vel_ad));
+        let sys: TrajectoryDynamics<f64, AutoDiff<NonlinearVelAd>, 2, 1, 1, 1, 4> =
+            TrajectoryDynamics::new(AutoDiff::new(NonlinearVelAd));
 
         let state = ComplexRotation { z: SVector::<f64, 2>::new(0.6, 0.8) };
         let control = SVector::<f64, 1>::new(2.0);

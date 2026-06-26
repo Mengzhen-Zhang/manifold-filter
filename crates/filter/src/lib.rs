@@ -161,14 +161,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::FilterState;
-    use manifold::diff::{AutoDiff, NormalDiff};
-    use manifold::dual::Dual;
+    use manifold::diff::{AutoDiff, DiffFn, NormalDiff};
     use manifold::manifold::{
         ComplexRotation, ProductSpace, RealLine, TimeVaryingConstraint, TrajectoryDynamics,
     };
-    use nalgebra::{SMatrix, SVector};
+    use nalgebra::{RealField, SMatrix, SVector};
 
     const EPS: f64 = 1e-9;
+
+    // Builds a generic scalar constant from an f64 literal.
+    #[inline]
+    fn c<S: RealField>(x: f64) -> S {
+        nalgebra::convert(x)
+    }
 
     // =========================================================================
     // Fixtures: closed-form dynamics / measurement / constraint functions.
@@ -196,8 +201,11 @@ mod tests {
     // Nonlinear dynamics for the AutoDiff path, packed input = [z0, z1, u, w].
     // The dual-number engine differentiates this; no hand-written Jacobian.
     //   f = z0^2 + 3u + 4w   =>  J = [2*z0, 0, 3, 4]
-    fn nonlinear_vel_ad(p: &SVector<Dual<f64>, 4>, y: &mut SVector<Dual<f64>, 1>) {
-        y[0] = p[0] * p[0] + p[2] * 3.0 + p[3] * 4.0;
+    struct NonlinearVelAd;
+    impl DiffFn<4, 1> for NonlinearVelAd {
+        fn eval<S: RealField + Copy>(&self, p: &SVector<S, 4>, y: &mut SVector<S, 1>) {
+            y[0] = p[0] * p[0] + p[2] * c(3.0) + p[3] * c(4.0);
+        }
     }
 
     // Scalar measurement / constraint on the real line:  h(x) = 3x  =>  J = [3]
@@ -316,8 +324,8 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn test_predict_rotation_autodiff_matches_closed_form() {
-        let dynamics: TrajectoryDynamics<f64, AutoDiff<f64, 4, 1>, 2, 1, 1, 1, 4> =
-            TrajectoryDynamics::new(AutoDiff::new(nonlinear_vel_ad));
+        let dynamics: TrajectoryDynamics<f64, AutoDiff<NonlinearVelAd>, 2, 1, 1, 1, 4> =
+            TrajectoryDynamics::new(AutoDiff::new(NonlinearVelAd));
 
         let mut fs = FilterState::<f64, ComplexRotation, 2, 1>::new(
             ComplexRotation { z: SVector::<f64, 2>::new(0.6, 0.8) },
