@@ -8,3 +8,7 @@ license.workspace = true
 manifold.workspace = true
 nalgebra.workspace = true
 num-traits.workspace = true
+
+[dev-dependencies]
+rand = "0.10"
+rand_distr = "0.6"

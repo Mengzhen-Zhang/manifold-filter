@@ -6,7 +6,23 @@ use manifold::manifold::TimeVaryingConstraint;
 
 const TOLERANCE: f64 = 1e-8;
 
-/// A unified tracking envelope holding the nominal manifold state 
+/// Mean-propagation scheme for the [`FilterState::predict`] time update. The
+/// covariance step is unaffected by the choice (the error-state transition is
+/// dominated by the attitude increment `ω·dt` and the flat p/v blocks, neither
+/// of which the scheme changes); only the nominal-state advance differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Integrator {
+    /// First-order Euler: one dynamics evaluation, `x ⊕ f(x)·dt`. Cheapest, and
+    /// exact for the attitude (constant-ω retract), but rectangle-integrates the
+    /// translational state — it grows over-confident under sustained dynamics.
+    Euler,
+    /// Second-order midpoint (RK2): re-evaluates the dynamics at the half-step,
+    /// capturing the within-step state curvature (rotating velocity / attitude)
+    /// for one extra dynamics evaluation. See the `integration_fidelity` example.
+    Midpoint,
+}
+
+/// A unified tracking envelope holding the nominal manifold state
 /// and its associated flat local tangent covariance.
 #[derive(Clone, Debug)]
 pub struct FilterState<S, M, const A_DIM: usize, const T_DIM: usize> {
@@ -40,21 +56,43 @@ where
 	control: &SVector<S, U_DIM>,
 	process_noise_covariance: &SMatrix<S, W_DIM, W_DIM>,
 	dt: S,
+	integrator: Integrator,
     ) where
 	DD: manifold::diff::Diff<S, TOTAL_DIM, T_DIM>,
     {
 	let (f_continuous, g_continuous) = dynamics.linearize(&self.state, control);
 
-	let identity_t = SMatrix::<S, T_DIM, T_DIM>::identity();
-	let f_discrete = &identity_t + (&f_continuous * dt);
-	let g_discrete = &g_continuous * dt;
-
 	let zero_noise = SVector::<S, W_DIM>::zeros();
-	let velocity = dynamics.evaluate_velocity(&self.state.to_ambient(), control, &zero_noise);
+	// Mean slope over the step. Euler samples the dynamics once at the start;
+	// midpoint re-evaluates at the half-step state (RK2), capturing within-step
+	// state curvature. Control is held across the step either way — the relevant
+	// curvature is state-dependent, not input-dependent (see integration_fidelity).
+	let velocity = match integrator {
+	    Integrator::Euler => {
+		dynamics.evaluate_velocity(&self.state.to_ambient(), control, &zero_noise)
+	    }
+	    Integrator::Midpoint => {
+		let half = S::from_f64(0.5).expect("cannot convert from f64");
+		let k1 = dynamics.evaluate_velocity(&self.state.to_ambient(), control, &zero_noise);
+		let mid = self.state.retract(&M::vector_to_tangent(&(k1 * (dt * half))));
+		dynamics.evaluate_velocity(&mid.to_ambient(), control, &zero_noise)
+	    }
+	};
 
 	let displacement = velocity * dt;
+	let disp_tangent = M::vector_to_tangent(&displacement);
+	let neg_disp_tangent = M::vector_to_tangent(&(-displacement));
 
-	self.state = self.state.retract(&M::vector_to_tangent(&displacement));
+	// Discrete state transition F = Ad_{Exp(−δ)} + F_cont·dt. The leading term
+	// is the prior error transported through the nominal step — the full
+	// adjoint, derived from parallel transport at ±δ: Ad_{Exp(−δ)} = T(δ)·T(−δ)⁻¹.
+	let t_fwd = self.state.parallel_transport(&disp_tangent);
+	let t_bwd = self.state.parallel_transport(&neg_disp_tangent);
+	let adjoint = &t_fwd * t_bwd.try_inverse().expect("predict: non-invertible parallel transport");
+	let f_discrete = &adjoint + (&f_continuous * dt);
+	let g_discrete = &g_continuous * dt;
+
+	self.state = self.state.retract(&disp_tangent);
 	self.covariance = {
 	    let f = &f_discrete;
 	    let cov = &self.covariance;
@@ -76,21 +114,40 @@ where
 	process_noise_covariance: &SMatrix<S, W_DIM, W_DIM>,
 	constraint: &TimeVaryingConstraint<S, DC, A_DIM, T_DIM, C_DIM>,
 	dt: S,
+	integrator: Integrator,
     ) where
 	DD: manifold::diff::Diff<S, TOTAL_DIM, T_DIM>,
 	DC: manifold::diff::Diff<S, A_DIM, C_DIM>,
     {
-	self.predict(dynamics, control, process_noise_covariance, dt);
+	self.predict(dynamics, control, process_noise_covariance, dt, integrator);
 	let tolerance = S::from_f64(TOLERANCE).expect("cannot convert from f64");
 	self.project_hard_constraints(constraint, tolerance, 5);
     }
 
+    /// Measurement update from a raw sensor outcome `y`: forms the Euclidean
+    /// innovation `y − h(x)` internally and applies the correction. Reach for
+    /// `correct_with_innovation` only when the residual is not a plain
+    /// subtraction (e.g. a manifold-valued measurement).
     #[inline]
     pub fn correct_measurement<D, const M_DIM: usize>(
         &mut self,
         measurement_engine: &TimeVaryingConstraint<S, D, A_DIM, T_DIM, M_DIM>,
-        innovation: &SVector<S, M_DIM>, // The pre-computed innovation vector: y_sensor - g(x)
+        measurement: &SVector<S, M_DIM>, // The raw sensor outcome y
         r_covariance: &SMatrix<S, M_DIM, M_DIM>, // Sensor measurement noise covariance (R)
+    ) where
+        D: manifold::diff::Diff<S, A_DIM, M_DIM>,
+    {
+	let predicted = measurement_engine.evaluate(&self.state.to_ambient());
+	self.correct_with_innovation(measurement_engine, &(*measurement - predicted), r_covariance);
+    }
+
+    /// Lower-level measurement update from a pre-computed innovation `y − h(x)`.
+    #[inline]
+    pub fn correct_with_innovation<D, const M_DIM: usize>(
+        &mut self,
+        measurement_engine: &TimeVaryingConstraint<S, D, A_DIM, T_DIM, M_DIM>,
+        innovation: &SVector<S, M_DIM>,
+        r_covariance: &SMatrix<S, M_DIM, M_DIM>,
     ) where
         D: manifold::diff::Diff<S, A_DIM, M_DIM>,
     {
@@ -141,16 +198,24 @@ where
 
             // 2. Map the innovation to a localized tangent space correction vector
             let tangent_correction = &gain * innovation_or_residual;
+            let delta = M::vector_to_tangent(&tangent_correction);
 
-            // 3. Step the nominal state mean along the curved manifold surface via retraction
-            self.state = self.state.retract(&M::vector_to_tangent(&tangent_correction));
+            // 3. Parallel transport of the correction, evaluated at the OLD
+            //    anchor, to carry the covariance into the new tangent frame below.
+            let transport = self.state.parallel_transport(&delta);
 
-            // 4. Reduce uncertainty variance safely (Standard form: P = (I - KH) * P)
+            // 4. Step the nominal state mean along the curved manifold surface via retraction
+            self.state = self.state.retract(&delta);
+
+            // 5. Reduce uncertainty variance safely (Standard form: P = (I - KH) * P)
             self.covariance = (&identity_t - (&gain * h_tangent)) * &self.covariance;
 
-            // 5. Force matrix symmetry to clean out compounding rounding artifacts
+            // 6. Reframe the covariance into the new tangent space: P = G * P * G^T
+            self.covariance = &transport * &self.covariance * transport.transpose();
+
+            // 7. Force matrix symmetry to clean out compounding rounding artifacts
             self.covariance = (&self.covariance + &self.covariance.transpose()) * S::from_f64(0.5).expect("cannot convert from f64");
-            
+
             true
         } else {
             false // Singularity or numerical breakdown guard
@@ -158,9 +223,11 @@ where
     }
 }
 
+
+
 #[cfg(test)]
 mod tests {
-    use super::FilterState;
+    use super::{FilterState, Integrator};
     use manifold::diff::{AutoDiff, DiffFn, NormalDiff};
     use manifold::manifold::{
         ComplexRotation, ProductSpace, RealLine, TimeVaryingConstraint, TrajectoryDynamics,
@@ -238,14 +305,14 @@ mod tests {
     }
 
     // Convenience alias for the product manifold used below.
-    type So2xR = ProductSpace<ComplexRotation, RealLine, 2, 1, 1, 1, 3, 2>;
+    type So2xR = ProductSpace<ComplexRotation<f64>, RealLine<f64>, 2, 1, 1, 1, 3, 2>;
 
     // -------------------------------------------------------------------------
     // new — stores the supplied state and covariance verbatim.
     // -------------------------------------------------------------------------
     #[test]
     fn test_new_stores_state_and_covariance() {
-        let fs = FilterState::<f64, RealLine, 1, 1>::new(
+        let fs = FilterState::<f64, RealLine<f64>, 1, 1>::new(
             RealLine { x: SVector::<f64, 1>::new(7.0) },
             SMatrix::<f64, 1, 1>::new(0.25),
         );
@@ -263,7 +330,7 @@ mod tests {
         let dynamics: TrajectoryDynamics<f64, NormalDiff<f64, 3, 1>, 1, 1, 1, 1, 3> =
             TrajectoryDynamics::new(NormalDiff::new(lin_vel, lin_vel_jac));
 
-        let mut fs = FilterState::<f64, RealLine, 1, 1>::new(
+        let mut fs = FilterState::<f64, RealLine<f64>, 1, 1>::new(
             RealLine { x: SVector::<f64, 1>::new(4.0) },
             SMatrix::<f64, 1, 1>::new(0.5),
         );
@@ -272,7 +339,7 @@ mod tests {
         let process_noise = SMatrix::<f64, 1, 1>::new(2.0);
         let dt = 0.1;
 
-        fs.predict(&dynamics, &control, &process_noise, dt);
+        fs.predict(&dynamics, &control, &process_noise, dt, Integrator::Euler);
 
         // velocity = -2*4 + 3*5 = 7 ;  x_new = 4 + 7*0.1 = 4.7
         assert!((fs.state.x[0] - 4.7).abs() < EPS);
@@ -292,7 +359,7 @@ mod tests {
         let dynamics: TrajectoryDynamics<f64, NormalDiff<f64, 4, 1>, 2, 1, 1, 1, 4> =
             TrajectoryDynamics::new(NormalDiff::new(rot_vel, rot_vel_jac));
 
-        let mut fs = FilterState::<f64, ComplexRotation, 2, 1>::new(
+        let mut fs = FilterState::<f64, ComplexRotation<f64>, 2, 1>::new(
             ComplexRotation::identity(),
             SMatrix::<f64, 1, 1>::new(0.1),
         );
@@ -301,7 +368,7 @@ mod tests {
         let process_noise = SMatrix::<f64, 1, 1>::new(1.0);
         let dt = 0.01;
 
-        fs.predict(&dynamics, &control, &process_noise, dt);
+        fs.predict(&dynamics, &control, &process_noise, dt, Integrator::Euler);
 
         // velocity = 2*1 + 5*0 + 7*0 = 2 ;  rotation angle = 2*0.01 = 0.02
         let angle = 0.02_f64;
@@ -327,7 +394,7 @@ mod tests {
         let dynamics: TrajectoryDynamics<f64, AutoDiff<NonlinearVelAd>, 2, 1, 1, 1, 4> =
             TrajectoryDynamics::new(AutoDiff::new(NonlinearVelAd));
 
-        let mut fs = FilterState::<f64, ComplexRotation, 2, 1>::new(
+        let mut fs = FilterState::<f64, ComplexRotation<f64>, 2, 1>::new(
             ComplexRotation { z: SVector::<f64, 2>::new(0.6, 0.8) },
             SMatrix::<f64, 1, 1>::new(0.2),
         );
@@ -336,7 +403,7 @@ mod tests {
         let process_noise = SMatrix::<f64, 1, 1>::new(1.0);
         let dt = 0.1;
 
-        fs.predict(&dynamics, &control, &process_noise, dt);
+        fs.predict(&dynamics, &control, &process_noise, dt, Integrator::Euler);
 
         // velocity = z0^2 + 3u = 0.36 + 6 = 6.36 ;  angle step = 6.36*0.1 = 0.636
         // SO(2) retraction adds the angle step to the starting heading.
@@ -361,20 +428,45 @@ mod tests {
         let meas: TimeVaryingConstraint<f64, NormalDiff<f64, 1, 1>, 1, 1, 1> =
             TimeVaryingConstraint::new(NormalDiff::new(scale3, scale3_jac));
 
-        let mut fs = FilterState::<f64, RealLine, 1, 1>::new(
+        let mut fs = FilterState::<f64, RealLine<f64>, 1, 1>::new(
             RealLine { x: SVector::<f64, 1>::new(4.0) },
             SMatrix::<f64, 1, 1>::new(2.0),
         );
 
-        let innovation = SVector::<f64, 1>::new(1.5);
+        // Raw measurement; h(x) = 3·4 = 12, so the internal innovation is 1.5.
+        let measurement = SVector::<f64, 1>::new(13.5);
         let r = SMatrix::<f64, 1, 1>::new(1.0);
-        fs.correct_measurement(&meas, &innovation, &r);
+        fs.correct_measurement(&meas, &measurement, &r);
 
         // H = 3 ;  S = 3*2*3 + 1 = 19 ;  K = 2*3/19 = 6/19
         // dx = K * innovation = (6/19)*1.5 = 9/19
         assert!((fs.state.x[0] - (4.0 + 9.0 / 19.0)).abs() < EPS);
         // P_new = (1 - K*H) * P = (1 - 18/19) * 2 = 2/19
         assert!((fs.covariance[(0, 0)] - 2.0 / 19.0).abs() < EPS);
+    }
+
+    // correct_measurement(y) must equal correct_with_innovation(y − h(x)).
+    #[test]
+    fn correct_measurement_matches_innovation_form() {
+        let meas: TimeVaryingConstraint<f64, NormalDiff<f64, 1, 1>, 1, 1, 1> =
+            TimeVaryingConstraint::new(NormalDiff::new(scale3, scale3_jac));
+        let r = SMatrix::<f64, 1, 1>::new(1.0);
+        let make = || {
+            FilterState::<f64, RealLine<f64>, 1, 1>::new(
+                RealLine { x: SVector::<f64, 1>::new(4.0) },
+                SMatrix::<f64, 1, 1>::new(2.0),
+            )
+        };
+
+        let mut a = make();
+        a.correct_measurement(&meas, &SVector::<f64, 1>::new(13.5), &r);
+
+        // Same update, innovation form: y − h(x) = 13.5 − 3·4 = 1.5.
+        let mut b = make();
+        b.correct_with_innovation(&meas, &SVector::<f64, 1>::new(1.5), &r);
+
+        assert!((a.state.x[0] - b.state.x[0]).abs() < EPS);
+        assert!((a.covariance[(0, 0)] - b.covariance[(0, 0)]).abs() < EPS);
     }
 
     // -------------------------------------------------------------------------
@@ -398,9 +490,11 @@ mod tests {
 
         let prior_trace = fs.covariance.trace();
 
-        let innovation = SVector::<f64, 2>::new(0.3, -0.4);
+        // h(x) = [z1, x] = [0, 0] at the identity state, so the measurement is
+        // the innovation here.
+        let measurement = SVector::<f64, 2>::new(0.3, -0.4);
         let r = SMatrix::<f64, 2, 2>::new(0.5, 0.0, 0.0, 0.5);
-        fs.correct_measurement(&meas, &innovation, &r);
+        fs.correct_measurement(&meas, &measurement, &r);
 
         // Posterior covariance is symmetric (the update forces it explicitly).
         assert!((fs.covariance[(0, 1)] - fs.covariance[(1, 0)]).abs() < EPS);
@@ -426,7 +520,7 @@ mod tests {
         let con: TimeVaryingConstraint<f64, NormalDiff<f64, 1, 1>, 1, 1, 1> =
             TimeVaryingConstraint::new(NormalDiff::new(scale3, scale3_jac));
 
-        let mut fs = FilterState::<f64, RealLine, 1, 1>::new(
+        let mut fs = FilterState::<f64, RealLine<f64>, 1, 1>::new(
             RealLine { x: SVector::<f64, 1>::new(4.0) },
             SMatrix::<f64, 1, 1>::new(1.0),
         );
@@ -449,14 +543,14 @@ mod tests {
         let con: TimeVaryingConstraint<f64, NormalDiff<f64, 1, 1>, 1, 1, 1> =
             TimeVaryingConstraint::new(NormalDiff::new(scale3, scale3_jac));
 
-        let mut fs = FilterState::<f64, RealLine, 1, 1>::new(
+        let mut fs = FilterState::<f64, RealLine<f64>, 1, 1>::new(
             RealLine { x: SVector::<f64, 1>::new(4.0) },
             SMatrix::<f64, 1, 1>::new(0.5),
         );
 
         let control = SVector::<f64, 1>::new(5.0);
         let process_noise = SMatrix::<f64, 1, 1>::new(2.0);
-        fs.predict_with_constraint(&dynamics, &control, &process_noise, &con, 0.1);
+        fs.predict_with_constraint(&dynamics, &control, &process_noise, &con, 0.1, Integrator::Euler);
 
         // Dynamics move x to 4.7; the hard constraint h(x)=3x=0 then projects it
         // exactly back onto the constraint surface.
@@ -476,7 +570,7 @@ mod tests {
             TimeVaryingConstraint::new(NormalDiff::new(unit_norm, unit_norm_jac));
 
         // Off the unit circle: residual = 2^2 + 0 - 1 = 3 (nonzero) ...
-        let mut fs = FilterState::<f64, ComplexRotation, 2, 1>::new(
+        let mut fs = FilterState::<f64, ComplexRotation<f64>, 2, 1>::new(
             ComplexRotation { z: SVector::<f64, 2>::new(2.0, 0.0) },
             SMatrix::<f64, 1, 1>::new(0.5),
         );

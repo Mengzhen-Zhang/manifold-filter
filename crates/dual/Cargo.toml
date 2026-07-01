@@ -9,3 +9,4 @@ nalgebra.workspace = true
 num-traits.workspace = true
 simba.workspace = true
 approx.workspace = true
+dual_derive.workspace = true

@@ -1,14 +1,21 @@
-use nalgebra::{RealField, SMatrix, SVector, Scalar};
-use num_traits::Zero;
 use crate::diff::Diff;
 use crate::manifold::Manifold;
+use nalgebra::{RealField, SMatrix, SVector, Scalar};
+use num_traits::Zero;
 
 /// A unified, stack-allocated trajectory dynamics engine.
 /// Completely handles packing, evaluation, and Jacobian extraction for any physical system.
 /// TOTAL_DIM stands for dimensions of the arguments of the dynamics function.
 #[derive(Clone, Debug)]
-pub struct TrajectoryDynamics<S, D, const A_DIM: usize, const T_DIM: usize, const U_DIM: usize, const W_DIM: usize, const TOTAL_DIM: usize>
-where
+pub struct TrajectoryDynamics<
+    S,
+    D,
+    const A_DIM: usize,
+    const T_DIM: usize,
+    const U_DIM: usize,
+    const W_DIM: usize,
+    const TOTAL_DIM: usize,
+> where
     D: Diff<S, TOTAL_DIM, T_DIM>,
 {
     pub diff_engine: D,
@@ -16,8 +23,15 @@ where
     _marker: core::marker::PhantomData<S>,
 }
 
-impl<S, D, const A_DIM: usize, const T_DIM: usize, const U_DIM: usize, const W_DIM: usize, const TOTAL_DIM: usize> 
-    TrajectoryDynamics<S, D, A_DIM, T_DIM, U_DIM, W_DIM, TOTAL_DIM>
+impl<
+        S,
+        D,
+        const A_DIM: usize,
+        const T_DIM: usize,
+        const U_DIM: usize,
+        const W_DIM: usize,
+        const TOTAL_DIM: usize,
+    > TrajectoryDynamics<S, D, A_DIM, T_DIM, U_DIM, W_DIM, TOTAL_DIM>
 where
     S: RealField,
     D: Diff<S, TOTAL_DIM, T_DIM>,
@@ -34,30 +48,44 @@ where
     /// Evaluates the continuous-time tangent velocity mapping: f(x, u, w) ∈ T_x M
     #[inline]
     pub fn evaluate_velocity(
-        &self, 
-        ambient_state: &SVector<S, A_DIM>, 
+        &self,
+        ambient_state: &SVector<S, A_DIM>,
         control: &SVector<S, U_DIM>,
-        noise: &SVector<S, W_DIM>
+        noise: &SVector<S, W_DIM>,
     ) -> SVector<S, T_DIM> {
         let mut packed_input = SVector::<S, TOTAL_DIM>::zeros();
-        packed_input.fixed_rows_mut::<A_DIM>(0).copy_from(ambient_state);
-        packed_input.fixed_rows_mut::<U_DIM>(A_DIM).copy_from(control);
-        packed_input.fixed_rows_mut::<W_DIM>({A_DIM + U_DIM}).copy_from(noise);
-        
+        packed_input
+            .fixed_rows_mut::<A_DIM>(0)
+            .copy_from(ambient_state);
+        packed_input
+            .fixed_rows_mut::<U_DIM>(A_DIM)
+            .copy_from(control);
+        packed_input
+            .fixed_rows_mut::<W_DIM>({ A_DIM + U_DIM })
+            .copy_from(noise);
+
         self.diff_engine.eval(&packed_input)
     }
 
     /// Linearizes the system physics, extracting both the State Error Transition matrix (F_x)
     /// and the Noise Diffusion matrix (G_w) in a single stack-allocated pass.
     #[inline]
-    pub fn linearize<M>(&self, state: &M, control: &SVector<S, U_DIM>) -> (SMatrix<S, T_DIM, T_DIM>, SMatrix<S, T_DIM, W_DIM>)
+    pub fn linearize<M>(
+        &self,
+        state: &M,
+        control: &SVector<S, U_DIM>,
+    ) -> (SMatrix<S, T_DIM, T_DIM>, SMatrix<S, T_DIM, W_DIM>)
     where
         M: Manifold<S, A_DIM, T_DIM>,
     {
         // 1. Pack state and control. Process noise expectation is nominally zero E[w] = 0
         let mut packed_input = SVector::<S, TOTAL_DIM>::zeros();
-        packed_input.fixed_rows_mut::<A_DIM>(0).copy_from(&state.to_ambient());
-        packed_input.fixed_rows_mut::<U_DIM>(A_DIM).copy_from(control);
+        packed_input
+            .fixed_rows_mut::<A_DIM>(0)
+            .copy_from(&state.to_ambient());
+        packed_input
+            .fixed_rows_mut::<U_DIM>(A_DIM)
+            .copy_from(control);
 
         // 2. Compute the raw combined Jacobian layout via the inner engine: size (T_DIM x (A_DIM + U_DIM + W_DIM))
         let raw_jacobian = self.diff_engine.jacobian(&packed_input);
@@ -68,7 +96,9 @@ where
         let f_tangent = j_ambient * j_oplus; // Continuous-time state transition matrix (T_DIM x T_DIM)
 
         // 4. Extract the raw noise columns directly (Noise lives in a flat vector space, no pushforward required)
-        let g_tangent = raw_jacobian.fixed_columns::<W_DIM>({A_DIM + U_DIM}).into_owned(); // (T_DIM x W_DIM)
+        let g_tangent = raw_jacobian
+            .fixed_columns::<W_DIM>({ A_DIM + U_DIM })
+            .into_owned(); // (T_DIM x W_DIM)
 
         (f_tangent, g_tangent)
     }
@@ -80,7 +110,7 @@ pub struct TimeVaryingConstraint<S, D, const A_DIM: usize, const T_DIM: usize, c
     _marker: core::marker::PhantomData<S>,
 }
 
-impl<S, D, const A_DIM: usize, const T_DIM: usize, const C_DIM: usize> 
+impl<S, D, const A_DIM: usize, const T_DIM: usize, const C_DIM: usize>
     TimeVaryingConstraint<S, D, A_DIM, T_DIM, C_DIM>
 where
     S: RealField,
@@ -89,7 +119,10 @@ where
     /// Constructor linking an AutoDiff or NormalDiff math engine representation.
     #[inline(always)]
     pub fn new(diff_engine: D) -> Self {
-        Self { diff_engine, _marker: core::marker::PhantomData }
+        Self {
+            diff_engine,
+            _marker: core::marker::PhantomData,
+        }
     }
 
     /// Evaluates the raw algebraic constraint residual equation h(x)
@@ -98,7 +131,7 @@ where
         self.diff_engine.eval(ambient_state)
     }
 
-    /// Linearizes the constraint equation, projecting the raw ambient Jacobian H_ambient 
+    /// Linearizes the constraint equation, projecting the raw ambient Jacobian H_ambient
     /// directly down into the manifold's local tangent frame: H_tangent = H_ambient * J_oplus
     #[inline(always)]
     pub fn linearize_tangent<M>(&self, state: &M) -> SMatrix<S, C_DIM, T_DIM>
@@ -116,13 +149,12 @@ where
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::{TrajectoryDynamics, TimeVaryingConstraint};
-    use crate::diff::{NormalDiff, AutoDiff, DiffFn};
-    use crate::manifold::{ComplexRotation, RealLine, Manifold};
-    use nalgebra::{RealField, SVector, SMatrix};
+    use super::{TimeVaryingConstraint, TrajectoryDynamics};
+    use crate::diff::{AutoDiff, DiffFn, NormalDiff};
+    use crate::manifold::{ComplexRotation, Manifold, RealLine};
+    use nalgebra::{RealField, SMatrix, SVector};
 
     const EPS: f64 = 1e-9;
 
@@ -185,10 +217,7 @@ mod tests {
         SVector::<f64, 2>::new(z[0] * z[0] + z[1] * z[1] - 1.0, z[0])
     }
     fn combined_jac(z: &SVector<f64, 2>) -> SMatrix<f64, 2, 2> {
-        SMatrix::<f64, 2, 2>::from_row_slice(&[
-            2.0 * z[0], 2.0 * z[1],
-            1.0,        0.0,
-        ])
+        SMatrix::<f64, 2, 2>::from_row_slice(&[2.0 * z[0], 2.0 * z[1], 1.0, 0.0])
     }
 
     // Scalar constraint on the real line:  h(x) = 3x  =>  J = [3]
@@ -226,7 +255,9 @@ mod tests {
         let sys: TrajectoryDynamics<f64, NormalDiff<f64, 3, 1>, 1, 1, 1, 1, 3> =
             TrajectoryDynamics::new(NormalDiff::new(lin_vel, lin_vel_jac));
 
-        let state = RealLine { x: SVector::<f64, 1>::new(4.0) };
+        let state = RealLine {
+            x: SVector::<f64, 1>::new(4.0),
+        };
         let control = SVector::<f64, 1>::new(5.0);
 
         let (f, g) = sys.linearize(&state, &control);
@@ -267,7 +298,9 @@ mod tests {
             TrajectoryDynamics::new(NormalDiff::new(rot_vel, rot_vel_jac));
 
         // Unit complex number (0.6, 0.8).
-        let state = ComplexRotation { z: SVector::<f64, 2>::new(0.6, 0.8) };
+        let state = ComplexRotation {
+            z: SVector::<f64, 2>::new(0.6, 0.8),
+        };
         let control = SVector::<f64, 1>::new(0.0);
 
         let (f, g) = sys.linearize(&state, &control);
@@ -287,7 +320,9 @@ mod tests {
         let sys: TrajectoryDynamics<f64, AutoDiff<NonlinearVelAd>, 2, 1, 1, 1, 4> =
             TrajectoryDynamics::new(AutoDiff::new(NonlinearVelAd));
 
-        let state = ComplexRotation { z: SVector::<f64, 2>::new(0.6, 0.8) };
+        let state = ComplexRotation {
+            z: SVector::<f64, 2>::new(0.6, 0.8),
+        };
         let control = SVector::<f64, 1>::new(2.0);
 
         // f = z0^2 + 3u + 4w at (0.6, 0.8, 2, 0) = 0.36 + 6 = 6.36
@@ -327,7 +362,9 @@ mod tests {
         let con: TimeVaryingConstraint<f64, NormalDiff<f64, 2, 1>, 2, 1, 1> =
             TimeVaryingConstraint::new(NormalDiff::new(unit_norm, unit_norm_jac));
 
-        let state = ComplexRotation { z: SVector::<f64, 2>::new(0.6, 0.8) };
+        let state = ComplexRotation {
+            z: SVector::<f64, 2>::new(0.6, 0.8),
+        };
         let h_tangent = con.linearize_tangent(&state);
 
         // H_ambient = [1.2, 1.6]; J_oplus = [-0.8, 0.6]^T
@@ -343,7 +380,9 @@ mod tests {
         let con: TimeVaryingConstraint<f64, NormalDiff<f64, 2, 1>, 2, 1, 1> =
             TimeVaryingConstraint::new(NormalDiff::new(x_coord, x_coord_jac));
 
-        let state = ComplexRotation { z: SVector::<f64, 2>::new(0.6, 0.8) };
+        let state = ComplexRotation {
+            z: SVector::<f64, 2>::new(0.6, 0.8),
+        };
         let h_tangent = con.linearize_tangent(&state);
 
         // H_ambient = [1, 0]; J_oplus = [-0.8, 0.6]^T  =>  -0.8
@@ -359,7 +398,9 @@ mod tests {
         let con: TimeVaryingConstraint<f64, NormalDiff<f64, 2, 2>, 2, 1, 2> =
             TimeVaryingConstraint::new(NormalDiff::new(combined, combined_jac));
 
-        let state = ComplexRotation { z: SVector::<f64, 2>::new(0.6, 0.8) };
+        let state = ComplexRotation {
+            z: SVector::<f64, 2>::new(0.6, 0.8),
+        };
         let h_tangent = con.linearize_tangent(&state); // 2 x 1
 
         // Row 0 (unit-norm, invariant) -> 0 ; Row 1 (x-coord) -> -0.8
@@ -376,7 +417,9 @@ mod tests {
         let con: TimeVaryingConstraint<f64, NormalDiff<f64, 1, 1>, 1, 1, 1> =
             TimeVaryingConstraint::new(NormalDiff::new(scale3, scale3_jac));
 
-        let state = RealLine { x: SVector::<f64, 1>::new(4.0) };
+        let state = RealLine {
+            x: SVector::<f64, 1>::new(4.0),
+        };
 
         let residual = con.evaluate(&state.to_ambient());
         assert!((residual[0] - 12.0).abs() < EPS); // 3 * 4

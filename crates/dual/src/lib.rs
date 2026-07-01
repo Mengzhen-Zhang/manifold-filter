@@ -9,11 +9,15 @@
 //! evaluation of `f: ℝᴺ → ℝᴹ` yields the whole `M×N` Jacobian ([`jacobian`]).
 //! `N` defaults to 1, recovering an ordinary scalar dual number.
 
+pub mod manifold;
+pub mod optimize;
+
+use approx::{AbsDiffEq, RelativeEq, UlpsEq};
 use core::fmt;
 use core::ops::{
     Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Rem, RemAssign, Sub, SubAssign,
 };
-use approx::{AbsDiffEq, RelativeEq, UlpsEq};
+pub use dual_derive::Manifold;
 use nalgebra::{ComplexField, Field, RealField, SMatrix, SVector, Scalar, SimdValue};
 use num_traits::{FromPrimitive, Num, One, Signed, Zero};
 use simba::scalar::{SubsetOf, SupersetOf};
@@ -29,7 +33,10 @@ pub struct Dual<T, const N: usize = 1> {
 // `SVector: Debug` needs `T: Scalar`, which the derive macro would not add.
 impl<T: Scalar, const N: usize> fmt::Debug for Dual<T, N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Dual").field("re", &self.re).field("eps", &self.eps).finish()
+        f.debug_struct("Dual")
+            .field("re", &self.re)
+            .field("eps", &self.eps)
+            .finish()
     }
 }
 
@@ -38,14 +45,14 @@ impl<T: Scalar, const N: usize> fmt::Debug for Dual<T, N> {
 impl<T: PartialEq, const N: usize> PartialEq for Dual<T, N> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-	self.re.eq(&other.re)
+        self.re.eq(&other.re)
     }
 }
 
 impl<T: PartialOrd, const N: usize> PartialOrd for Dual<T, N> {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-	self.re.partial_cmp(&other.re)
+        self.re.partial_cmp(&other.re)
     }
 }
 
@@ -53,7 +60,7 @@ impl<T, const N: usize> Dual<T, N> {
     /// Builds a dual directly from a value and an explicit tangent vector.
     #[inline]
     pub const fn new(re: T, eps: SVector<T, N>) -> Self {
-	Self { re, eps }
+        Self { re, eps }
     }
 }
 
@@ -61,133 +68,155 @@ impl<T: RealField + Copy, const N: usize> Dual<T, N> {
     /// A constant: value `re`, zero derivative.
     #[inline]
     pub fn from_re(re: T) -> Self {
-	Self::new(re, SVector::zeros())
+        Self::new(re, SVector::zeros())
     }
 
     /// Alias for [`Dual::from_re`].
     #[inline]
     pub fn constant(re: T) -> Self {
-	Self::from_re(re)
+        Self::from_re(re)
     }
 
     /// Seeds the `i`-th independent variable: value `re`, tangent direction `eᵢ`.
     #[inline]
     pub fn seed(re: T, i: usize) -> Self {
-	let mut eps = SVector::<T, N>::zeros();
-	eps[i] = T::one();
-	Self::new(re, eps)
+        let mut eps = SVector::<T, N>::zeros();
+        eps[i] = T::one();
+        Self::new(re, eps)
+    }
+
+    /// Constructs a dual, debug-asserting that the tangent (derivative) is
+    /// finite. A non-finite tangent means the function was differentiated at a
+    /// singular point — `sqrt'(0)` (the ‖·‖ origin), `1/x` at `x = 0`, an
+    /// `atan2` at the origin — where the derivative genuinely does not exist.
+    ///
+    /// Policy: fail loudly at the source op in debug builds rather than
+    /// silently fabricate a value (such as a 0 sub-gradient). In release the
+    /// assertion compiles out and the non-finite tangent propagates faithfully,
+    /// keeping the type `no_std`/embedded-safe. Primal-value finiteness is the
+    /// caller's concern, as with any `f64` computation, so only the tangent is
+    /// checked here.
+    #[inline]
+    fn checked(re: T, eps: SVector<T, N>) -> Self {
+        debug_assert!(
+            eps.iter().all(|e| e.is_finite()),
+            "Dual: non-finite derivative — differentiated at a singular point",
+        );
+        Self::new(re, eps)
     }
 
     // Applies the chain rule for a unary function: value `val`, local slope `deriv`.
     #[inline]
     fn chain(self, val: T, deriv: T) -> Self {
-	debug_assert!(val.is_finite() && deriv.is_finite(), "non-finite dual
-  derivative");
-	Self::new(val, self.eps * deriv)
+        Self::checked(val, self.eps * deriv)
     }
 
     // Power with a dual exponent: d/dt x^n = x^n (n' ln x + n x'/x).
     #[inline]
     fn powf_dual(self, n: Self) -> Self {
-	let v = self.re.powf(n.re);
-	let eps = (n.eps * self.re.ln() + self.eps * (n.re / self.re)) * v;
-	Self::new(v, eps)
+        let v = self.re.powf(n.re);
+        let eps = (n.eps * self.re.ln() + self.eps * (n.re / self.re)) * v;
+        Self::checked(v, eps)
     }
 
     #[inline]
     pub fn recip(self) -> Self {
-	let inv = T::one() / self.re;
-	self.chain(inv, -(inv * inv))
+        let inv = T::one() / self.re;
+        self.chain(inv, -(inv * inv))
     }
 
     #[inline]
     pub fn sin(self) -> Self {
-	self.chain(self.re.sin(), self.re.cos())
+        self.chain(self.re.sin(), self.re.cos())
     }
 
     #[inline]
     pub fn cos(self) -> Self {
-	self.chain(self.re.cos(), -self.re.sin())
+        self.chain(self.re.cos(), -self.re.sin())
     }
 
     #[inline]
     pub fn sqrt(self) -> Self {
-	let s = self.re.sqrt();
-	self.chain(s, T::one() / (s + s))
+        let s = self.re.sqrt();
+        self.chain(s, T::one() / (s + s))
     }
 
     #[inline]
     pub fn exp(self) -> Self {
-	let e = self.re.exp();
-	self.chain(e, e)
+        let e = self.re.exp();
+        self.chain(e, e)
     }
 
     #[inline]
     pub fn ln(self) -> Self {
-	self.chain(self.re.ln(), T::one() / self.re)
+        self.chain(self.re.ln(), T::one() / self.re)
     }
 
     #[inline]
     pub fn powi(self, n: i32) -> Self {
-	let nt = T::from_i32(n).expect("i32 -> T conversion failed");
-	self.chain(self.re.powi(n), nt * self.re.powi(n - 1))
+        let nt = T::from_i32(n).expect("i32 -> T conversion failed");
+        self.chain(self.re.powi(n), nt * self.re.powi(n - 1))
     }
 
     #[inline]
     pub fn powf(self, p: T) -> Self {
-	self.chain(self.re.powf(p), p * self.re.powf(p - T::one()))
+        self.chain(self.re.powf(p), p * self.re.powf(p - T::one()))
     }
 
     #[inline]
     pub fn tan(self) -> Self {
-	let c = self.re.cos();
-	self.chain(self.re.tan(), T::one() / (c * c))
+        let c = self.re.cos();
+        self.chain(self.re.tan(), T::one() / (c * c))
     }
 
     #[inline]
     pub fn asin(self) -> Self {
-	let d = T::one() / (T::one() - self.re * self.re).sqrt();
-	self.chain(self.re.asin(), d)
+        let d = T::one() / (T::one() - self.re * self.re).sqrt();
+        self.chain(self.re.asin(), d)
     }
 
     #[inline]
     pub fn acos(self) -> Self {
-	let d = -(T::one() / (T::one() - self.re * self.re).sqrt());
-	self.chain(self.re.acos(), d)
+        let d = -(T::one() / (T::one() - self.re * self.re).sqrt());
+        self.chain(self.re.acos(), d)
     }
 
     #[inline]
     pub fn atan(self) -> Self {
-	let d = T::one() / (T::one() + self.re * self.re);
-	self.chain(self.re.atan(), d)
+        let d = T::one() / (T::one() + self.re * self.re);
+        self.chain(self.re.atan(), d)
     }
 
     #[inline]
     pub fn hypot(self, other: Self) -> Self {
-	let re = (self.re * self.re + other.re * other.re).sqrt();
-	let eps = (self.eps * self.re + other.eps * other.re) / re;
-	Self::new(re, eps)
+        let re = (self.re * self.re + other.re * other.re).sqrt();
+        let eps = (self.eps * self.re + other.eps * other.re) / re;
+        Self::checked(re, eps)
     }
 
     #[inline]
     pub fn abs(&self) -> Self {
-	if self.re >= T::zero() { *self } else { -*self }
+        if self.re >= T::zero() {
+            *self
+        } else {
+            -*self
+        }
     }
 
     #[inline]
     pub fn tanh(self) -> Self {
-	let t = self.re.tanh();
-	self.chain(t, T::one() - t * t)
+        let t = self.re.tanh();
+        self.chain(t, T::one() - t * t)
     }
 
     #[inline]
     pub fn sinh(self) -> Self {
-	self.chain(self.re.sinh(), self.re.cosh())
+        self.chain(self.re.sinh(), self.re.cosh())
     }
 
     #[inline]
     pub fn cosh(self) -> Self {
-	self.chain(self.re.cosh(), self.re.sinh())
+        self.chain(self.re.cosh(), self.re.sinh())
     }
 }
 
@@ -198,7 +227,7 @@ impl<T: RealField + Copy, const N: usize> Add for Dual<T, N> {
     type Output = Self;
     #[inline]
     fn add(self, rhs: Self) -> Self {
-	Self::new(self.re + rhs.re, self.eps + rhs.eps)
+        Self::new(self.re + rhs.re, self.eps + rhs.eps)
     }
 }
 
@@ -206,7 +235,7 @@ impl<T: RealField + Copy, const N: usize> Sub for Dual<T, N> {
     type Output = Self;
     #[inline]
     fn sub(self, rhs: Self) -> Self {
-	Self::new(self.re - rhs.re, self.eps - rhs.eps)
+        Self::new(self.re - rhs.re, self.eps - rhs.eps)
     }
 }
 
@@ -214,8 +243,8 @@ impl<T: RealField + Copy, const N: usize> Mul for Dual<T, N> {
     type Output = Self;
     #[inline]
     fn mul(self, rhs: Self) -> Self {
-	// Product rule: (u*v)' = u'*v + u*v'
-	Self::new(self.re * rhs.re, self.eps * rhs.re + rhs.eps * self.re)
+        // Product rule: (u*v)' = u'*v + u*v'
+        Self::new(self.re * rhs.re, self.eps * rhs.re + rhs.eps * self.re)
     }
 }
 
@@ -223,9 +252,12 @@ impl<T: RealField + Copy, const N: usize> Div for Dual<T, N> {
     type Output = Self;
     #[inline]
     fn div(self, rhs: Self) -> Self {
-	// Quotient rule: (u/v)' = (u'*v - u*v') / v^2
-	let denom = rhs.re * rhs.re;
-	Self::new(self.re / rhs.re, (self.eps * rhs.re - rhs.eps * self.re) / denom)
+        // Quotient rule: (u/v)' = (u'*v - u*v') / v^2
+        let denom = rhs.re * rhs.re;
+        Self::checked(
+            self.re / rhs.re,
+            (self.eps * rhs.re - rhs.eps * self.re) / denom,
+        )
     }
 }
 
@@ -236,7 +268,7 @@ impl<T: RealField + Copy, const N: usize> Mul<T> for Dual<T, N> {
     type Output = Self;
     #[inline]
     fn mul(self, rhs: T) -> Self::Output {
-	Self::new(self.re * rhs, self.eps * rhs)
+        Self::new(self.re * rhs, self.eps * rhs)
     }
 }
 
@@ -244,7 +276,7 @@ impl<T: RealField + Copy, const N: usize> Div<T> for Dual<T, N> {
     type Output = Self;
     #[inline]
     fn div(self, rhs: T) -> Self::Output {
-	Self::new(self.re / rhs, self.eps / rhs)
+        Self::checked(self.re / rhs, self.eps / rhs)
     }
 }
 
@@ -252,7 +284,7 @@ impl<T: RealField + Copy, const N: usize> Add<T> for Dual<T, N> {
     type Output = Self;
     #[inline]
     fn add(self, rhs: T) -> Self::Output {
-	Self::new(self.re + rhs, self.eps)
+        Self::new(self.re + rhs, self.eps)
     }
 }
 
@@ -260,7 +292,7 @@ impl<T: RealField + Copy, const N: usize> Sub<T> for Dual<T, N> {
     type Output = Self;
     #[inline]
     fn sub(self, rhs: T) -> Self::Output {
-	Self::new(self.re - rhs, self.eps)
+        Self::new(self.re - rhs, self.eps)
     }
 }
 
@@ -268,7 +300,7 @@ impl<T: RealField + Copy, const N: usize> Neg for Dual<T, N> {
     type Output = Self;
     #[inline]
     fn neg(self) -> Self::Output {
-	Self::new(-self.re, -self.eps)
+        Self::new(-self.re, -self.eps)
     }
 }
 
@@ -276,9 +308,9 @@ impl<T: RealField + Copy, const N: usize> Rem for Dual<T, N> {
     type Output = Self;
     #[inline]
     fn rem(self, rhs: Self) -> Self {
-	// Only exists to satisfy `Num: NumOps`; the modulus boundary is
-	// non-differentiable and never sits on an AD path.
-	Self::new(self.re % rhs.re, self.eps)
+        // Only exists to satisfy `Num: NumOps`; the modulus boundary is
+        // non-differentiable and never sits on an AD path.
+        Self::new(self.re % rhs.re, self.eps)
     }
 }
 
@@ -289,7 +321,7 @@ impl<const N: usize> Mul<Dual<f64, N>> for f64 {
     type Output = Dual<f64, N>;
     #[inline]
     fn mul(self, rhs: Dual<f64, N>) -> Self::Output {
-	Dual::new(self * rhs.re, rhs.eps * self)
+        Dual::new(self * rhs.re, rhs.eps * self)
     }
 }
 
@@ -297,7 +329,7 @@ impl<const N: usize> Mul<Dual<f32, N>> for f32 {
     type Output = Dual<f32, N>;
     #[inline]
     fn mul(self, rhs: Dual<f32, N>) -> Self::Output {
-	Dual::new(self * rhs.re, rhs.eps * self)
+        Dual::new(self * rhs.re, rhs.eps * self)
     }
 }
 
@@ -305,7 +337,7 @@ impl<const N: usize> Add<Dual<f64, N>> for f64 {
     type Output = Dual<f64, N>;
     #[inline]
     fn add(self, rhs: Dual<f64, N>) -> Self::Output {
-	Dual::new(self + rhs.re, rhs.eps)
+        Dual::new(self + rhs.re, rhs.eps)
     }
 }
 
@@ -313,7 +345,7 @@ impl<const N: usize> Add<Dual<f32, N>> for f32 {
     type Output = Dual<f32, N>;
     #[inline]
     fn add(self, rhs: Dual<f32, N>) -> Self::Output {
-	Dual::new(self + rhs.re, rhs.eps)
+        Dual::new(self + rhs.re, rhs.eps)
     }
 }
 
@@ -321,8 +353,8 @@ impl<const N: usize> Sub<Dual<f64, N>> for f64 {
     type Output = Dual<f64, N>;
     #[inline]
     fn sub(self, rhs: Dual<f64, N>) -> Self::Output {
-	// d/dt (c - x) = -x'
-	Dual::new(self - rhs.re, -rhs.eps)
+        // d/dt (c - x) = -x'
+        Dual::new(self - rhs.re, -rhs.eps)
     }
 }
 
@@ -330,7 +362,7 @@ impl<const N: usize> Sub<Dual<f32, N>> for f32 {
     type Output = Dual<f32, N>;
     #[inline]
     fn sub(self, rhs: Dual<f32, N>) -> Self::Output {
-	Dual::new(self - rhs.re, -rhs.eps)
+        Dual::new(self - rhs.re, -rhs.eps)
     }
 }
 
@@ -338,9 +370,9 @@ impl<const N: usize> Div<Dual<f64, N>> for f64 {
     type Output = Dual<f64, N>;
     #[inline]
     fn div(self, rhs: Dual<f64, N>) -> Self::Output {
-	// d/dt (c / x) = -c x' / x^2
-	let denom = rhs.re * rhs.re;
-	Dual::new(self / rhs.re, rhs.eps * (-self / denom))
+        // d/dt (c / x) = -c x' / x^2
+        let denom = rhs.re * rhs.re;
+        Dual::checked(self / rhs.re, rhs.eps * (-self / denom))
     }
 }
 
@@ -348,8 +380,8 @@ impl<const N: usize> Div<Dual<f32, N>> for f32 {
     type Output = Dual<f32, N>;
     #[inline]
     fn div(self, rhs: Dual<f32, N>) -> Self::Output {
-	let denom = rhs.re * rhs.re;
-	Dual::new(self / rhs.re, rhs.eps * (-self / denom))
+        let denom = rhs.re * rhs.re;
+        Dual::checked(self / rhs.re, rhs.eps * (-self / denom))
     }
 }
 
@@ -359,63 +391,63 @@ impl<const N: usize> Div<Dual<f32, N>> for f32 {
 impl<T: RealField + Copy, const N: usize> AddAssign for Dual<T, N> {
     #[inline]
     fn add_assign(&mut self, rhs: Self) {
-	*self = *self + rhs;
+        *self = *self + rhs;
     }
 }
 
 impl<T: RealField + Copy, const N: usize> SubAssign for Dual<T, N> {
     #[inline]
     fn sub_assign(&mut self, rhs: Self) {
-	*self = *self - rhs;
+        *self = *self - rhs;
     }
 }
 
 impl<T: RealField + Copy, const N: usize> MulAssign for Dual<T, N> {
     #[inline]
     fn mul_assign(&mut self, rhs: Self) {
-	*self = *self * rhs; // product rule, via Mul
+        *self = *self * rhs; // product rule, via Mul
     }
 }
 
 impl<T: RealField + Copy, const N: usize> DivAssign for Dual<T, N> {
     #[inline]
     fn div_assign(&mut self, rhs: Self) {
-	*self = *self / rhs; // quotient rule, via Div
+        *self = *self / rhs; // quotient rule, via Div
     }
 }
 
 impl<T: RealField + Copy, const N: usize> RemAssign for Dual<T, N> {
     #[inline]
     fn rem_assign(&mut self, rhs: Self) {
-	*self = *self % rhs;
+        *self = *self % rhs;
     }
 }
 
 impl<T: RealField + Copy, const N: usize> AddAssign<T> for Dual<T, N> {
     #[inline]
     fn add_assign(&mut self, rhs: T) {
-	self.re += rhs;
+        self.re += rhs;
     }
 }
 
 impl<T: RealField + Copy, const N: usize> SubAssign<T> for Dual<T, N> {
     #[inline]
     fn sub_assign(&mut self, rhs: T) {
-	self.re -= rhs;
+        self.re -= rhs;
     }
 }
 
 impl<T: RealField + Copy, const N: usize> MulAssign<T> for Dual<T, N> {
     #[inline]
     fn mul_assign(&mut self, rhs: T) {
-	*self = *self * rhs;
+        *self = *self * rhs;
     }
 }
 
 impl<T: RealField + Copy, const N: usize> DivAssign<T> for Dual<T, N> {
     #[inline]
     fn div_assign(&mut self, rhs: T) {
-	*self = *self / rhs;
+        *self = *self / rhs;
     }
 }
 
@@ -425,22 +457,22 @@ impl<T: RealField + Copy, const N: usize> DivAssign<T> for Dual<T, N> {
 impl<T: RealField + Copy, const N: usize> Zero for Dual<T, N> {
     #[inline]
     fn zero() -> Self {
-	Self::from_re(T::zero())
+        Self::from_re(T::zero())
     }
     #[inline]
     fn is_zero(&self) -> bool {
-	self.re.is_zero() && self.eps == SVector::<T, N>::zeros()
+        self.re.is_zero() && self.eps == SVector::<T, N>::zeros()
     }
 }
 
 impl<T: RealField + Copy, const N: usize> One for Dual<T, N> {
     #[inline]
     fn one() -> Self {
-	Self::from_re(T::one())
+        Self::from_re(T::one())
     }
     #[inline]
     fn is_one(&self) -> bool {
-	self.re.is_one() && self.eps == SVector::<T, N>::zeros()
+        self.re.is_one() && self.eps == SVector::<T, N>::zeros()
     }
 }
 
@@ -448,7 +480,7 @@ impl<T: RealField + Copy, const N: usize> Num for Dual<T, N> {
     type FromStrRadixErr = ();
     #[inline]
     fn from_str_radix(_s: &str, _radix: u32) -> Result<Self, Self::FromStrRadixErr> {
-	Err(()) // never invoked by linear-algebra paths
+        Err(()) // never invoked by linear-algebra paths
     }
 }
 
@@ -456,35 +488,43 @@ impl<T: RealField + Copy, const N: usize> Signed for Dual<T, N> {
     // |x| = x for x >= 0 else -x; Neg already carries the matching signum*eps.
     #[inline]
     fn abs(&self) -> Self {
-	if self.re >= T::zero() { *self } else { -*self }
+        if self.re >= T::zero() {
+            *self
+        } else {
+            -*self
+        }
     }
 
     #[inline]
     fn abs_sub(&self, other: &Self) -> Self {
-	if self.re <= other.re { Self::zero() } else { *self - *other }
+        if self.re <= other.re {
+            Self::zero()
+        } else {
+            *self - *other
+        }
     }
 
     // signum is piecewise constant => derivative 0.
     #[inline]
     fn signum(&self) -> Self {
-	let v = if self.re > T::zero() {
-	    T::one()
-	} else if self.re < T::zero() {
-	    -T::one()
-	} else {
-	    T::zero()
-	};
-	Self::from_re(v)
+        let v = if self.re > T::zero() {
+            T::one()
+        } else if self.re < T::zero() {
+            -T::one()
+        } else {
+            T::zero()
+        };
+        Self::from_re(v)
     }
 
     #[inline]
     fn is_positive(&self) -> bool {
-	self.re > T::zero()
+        self.re > T::zero()
     }
 
     #[inline]
     fn is_negative(&self) -> bool {
-	self.re < T::zero()
+        self.re < T::zero()
     }
 }
 
@@ -492,25 +532,25 @@ impl<T: RealField + Copy, const N: usize> FromPrimitive for Dual<T, N> {
     // Primitive constants have zero derivative.
     #[inline]
     fn from_i64(n: i64) -> Option<Self> {
-	T::from_i64(n).map(Self::from_re)
+        T::from_i64(n).map(Self::from_re)
     }
     #[inline]
     fn from_u64(n: u64) -> Option<Self> {
-	T::from_u64(n).map(Self::from_re)
+        T::from_u64(n).map(Self::from_re)
     }
     #[inline]
     fn from_f64(n: f64) -> Option<Self> {
-	T::from_f64(n).map(Self::from_re)
+        T::from_f64(n).map(Self::from_re)
     }
     #[inline]
     fn from_f32(n: f32) -> Option<Self> {
-	T::from_f32(n).map(Self::from_re)
+        T::from_f32(n).map(Self::from_re)
     }
 }
 
 impl<T: RealField + Copy, const N: usize> fmt::Display for Dual<T, N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-	write!(f, "{} + {}\u{3b5}", self.re, self.eps.transpose())
+        write!(f, "{} + {}\u{3b5}", self.re, self.eps.transpose())
     }
 }
 
@@ -524,27 +564,31 @@ impl<T: RealField + Copy, const N: usize> SimdValue for Dual<T, N> {
 
     #[inline]
     fn splat(val: Self::Element) -> Self {
-	val
+        val
     }
     #[inline]
     fn extract(&self, _: usize) -> Self::Element {
-	*self
+        *self
     }
     #[inline]
     unsafe fn extract_unchecked(&self, _: usize) -> Self::Element {
-	*self
+        *self
     }
     #[inline]
     fn replace(&mut self, _: usize, val: Self::Element) {
-	*self = val;
+        *self = val;
     }
     #[inline]
     unsafe fn replace_unchecked(&mut self, _: usize, val: Self::Element) {
-	*self = val;
+        *self = val;
     }
     #[inline]
     fn select(self, cond: Self::SimdBool, other: Self) -> Self {
-	if cond { self } else { other }
+        if cond {
+            self
+        } else {
+            other
+        }
     }
 }
 
@@ -555,45 +599,45 @@ impl<T: RealField + Copy, const N: usize> SimdValue for Dual<T, N> {
 impl<T: RealField + Copy, const N: usize> SubsetOf<Self> for Dual<T, N> {
     #[inline]
     fn to_superset(&self) -> Self {
-	*self
+        *self
     }
     #[inline]
     fn from_superset_unchecked(element: &Self) -> Self {
-	*element
+        *element
     }
     #[inline]
     fn is_in_subset(_element: &Self) -> bool {
-	true
+        true
     }
 }
 
 impl<T: RealField + Copy, const N: usize> SupersetOf<f64> for Dual<T, N> {
     #[inline]
     fn is_in_subset(&self) -> bool {
-	<T as SupersetOf<f64>>::is_in_subset(&self.re)
+        <T as SupersetOf<f64>>::is_in_subset(&self.re)
     }
     #[inline]
     fn to_subset_unchecked(&self) -> f64 {
-	<T as SupersetOf<f64>>::to_subset_unchecked(&self.re)
+        <T as SupersetOf<f64>>::to_subset_unchecked(&self.re)
     }
     #[inline]
     fn from_subset(element: &f64) -> Self {
-	Self::from_re(<T as SupersetOf<f64>>::from_subset(element))
+        Self::from_re(<T as SupersetOf<f64>>::from_subset(element))
     }
 }
 
 impl<T: RealField + Copy, const N: usize> SupersetOf<f32> for Dual<T, N> {
     #[inline]
     fn is_in_subset(&self) -> bool {
-	<T as SupersetOf<f32>>::is_in_subset(&self.re)
+        <T as SupersetOf<f32>>::is_in_subset(&self.re)
     }
     #[inline]
     fn to_subset_unchecked(&self) -> f32 {
-	<T as SupersetOf<f32>>::to_subset_unchecked(&self.re)
+        <T as SupersetOf<f32>>::to_subset_unchecked(&self.re)
     }
     #[inline]
     fn from_subset(element: &f32) -> Self {
-	Self::from_re(<T as SupersetOf<f32>>::from_subset(element))
+        Self::from_re(<T as SupersetOf<f32>>::from_subset(element))
     }
 }
 
@@ -604,38 +648,38 @@ impl<T: RealField + Copy, const N: usize> AbsDiffEq for Dual<T, N> {
     type Epsilon = Self;
     #[inline]
     fn default_epsilon() -> Self::Epsilon {
-	Self::from_re(T::default_epsilon())
+        Self::from_re(T::default_epsilon())
     }
     #[inline]
     fn abs_diff_eq(&self, other: &Self, epsilon: Self::Epsilon) -> bool {
-	self.re.abs_diff_eq(&other.re, epsilon.re)
+        self.re.abs_diff_eq(&other.re, epsilon.re)
     }
 }
 
 impl<T: RealField + Copy, const N: usize> RelativeEq for Dual<T, N> {
     #[inline]
     fn default_max_relative() -> Self::Epsilon {
-	Self::from_re(T::default_max_relative())
+        Self::from_re(T::default_max_relative())
     }
     #[inline]
     fn relative_eq(
-	&self,
-	other: &Self,
-	epsilon: Self::Epsilon,
-	max_relative: Self::Epsilon,
+        &self,
+        other: &Self,
+        epsilon: Self::Epsilon,
+        max_relative: Self::Epsilon,
     ) -> bool {
-	self.re.relative_eq(&other.re, epsilon.re, max_relative.re)
+        self.re.relative_eq(&other.re, epsilon.re, max_relative.re)
     }
 }
 
 impl<T: RealField + Copy, const N: usize> UlpsEq for Dual<T, N> {
     #[inline]
     fn default_max_ulps() -> u32 {
-	T::default_max_ulps()
+        T::default_max_ulps()
     }
     #[inline]
     fn ulps_eq(&self, other: &Self, epsilon: Self::Epsilon, max_ulps: u32) -> bool {
-	self.re.ulps_eq(&other.re, epsilon.re, max_ulps)
+        self.re.ulps_eq(&other.re, epsilon.re, max_ulps)
     }
 }
 
@@ -650,331 +694,353 @@ impl<T: RealField + Copy, const N: usize> ComplexField for Dual<T, N> {
 
     #[inline]
     fn from_real(re: Self::RealField) -> Self {
-	re
+        re
     }
     #[inline]
     fn real(self) -> Self::RealField {
-	self
+        self
     }
     #[inline]
     fn imaginary(self) -> Self::RealField {
-	Self::zero()
+        Self::zero()
     }
     #[inline]
     fn modulus(self) -> Self::RealField {
-	Signed::abs(&self)
+        Signed::abs(&self)
     }
     #[inline]
     fn modulus_squared(self) -> Self::RealField {
-	self * self
+        self * self
     }
     #[inline]
     fn argument(self) -> Self::RealField {
-	if self.re >= T::zero() { Self::zero() } else { Self::pi() }
+        if self.re >= T::zero() {
+            Self::zero()
+        } else {
+            Self::pi()
+        }
     }
     #[inline]
     fn norm1(self) -> Self::RealField {
-	Signed::abs(&self)
+        Signed::abs(&self)
     }
     #[inline]
     fn scale(self, factor: Self::RealField) -> Self {
-	self * factor
+        self * factor
     }
     #[inline]
     fn unscale(self, factor: Self::RealField) -> Self {
-	self / factor
+        self / factor
     }
 
     #[inline]
     fn floor(self) -> Self {
-	Self::from_re(self.re.floor())
+        Self::from_re(self.re.floor())
     }
     #[inline]
     fn ceil(self) -> Self {
-	Self::from_re(self.re.ceil())
+        Self::from_re(self.re.ceil())
     }
     #[inline]
     fn round(self) -> Self {
-	Self::from_re(self.re.round())
+        Self::from_re(self.re.round())
     }
     #[inline]
     fn trunc(self) -> Self {
-	Self::from_re(self.re.trunc())
+        Self::from_re(self.re.trunc())
     }
     #[inline]
     fn fract(self) -> Self {
-	Self::new(self.re.fract(), self.eps)
+        Self::new(self.re.fract(), self.eps)
     }
     #[inline]
     fn mul_add(self, a: Self, b: Self) -> Self {
-	self * a + b
+        self * a + b
     }
     // signum is piecewise constant => derivative 0 (overrides the trait default).
     #[inline]
     fn signum(self) -> Self {
-	Self::from_re(self.re.signum())
+        Self::from_re(self.re.signum())
     }
 
     #[inline]
     fn abs(self) -> Self::RealField {
-	Signed::abs(&self)
+        Signed::abs(&self)
     }
     #[inline]
     fn hypot(self, other: Self) -> Self::RealField {
-	Dual::hypot(self, other)
+        Dual::hypot(self, other)
     }
     #[inline]
     fn recip(self) -> Self {
-	Dual::recip(self)
+        Dual::recip(self)
     }
     #[inline]
     fn conjugate(self) -> Self {
-	self
+        self
     }
 
     #[inline]
     fn sin(self) -> Self {
-	Dual::sin(self)
+        Dual::sin(self)
     }
     #[inline]
     fn cos(self) -> Self {
-	Dual::cos(self)
+        Dual::cos(self)
     }
     #[inline]
     fn sin_cos(self) -> (Self, Self) {
-	(Dual::sin(self), Dual::cos(self))
+        (Dual::sin(self), Dual::cos(self))
     }
     #[inline]
     fn tan(self) -> Self {
-	Dual::tan(self)
+        Dual::tan(self)
     }
     #[inline]
     fn asin(self) -> Self {
-	Dual::asin(self)
+        Dual::asin(self)
     }
     #[inline]
     fn acos(self) -> Self {
-	Dual::acos(self)
+        Dual::acos(self)
     }
     #[inline]
     fn atan(self) -> Self {
-	Dual::atan(self)
+        Dual::atan(self)
     }
     #[inline]
     fn sinh(self) -> Self {
-	Dual::sinh(self)
+        Dual::sinh(self)
     }
     #[inline]
     fn cosh(self) -> Self {
-	Dual::cosh(self)
+        Dual::cosh(self)
     }
     #[inline]
     fn tanh(self) -> Self {
-	Dual::tanh(self)
+        Dual::tanh(self)
     }
     #[inline]
     fn asinh(self) -> Self {
-	self.chain(self.re.asinh(), T::one() / (self.re * self.re + T::one()).sqrt())
+        self.chain(
+            self.re.asinh(),
+            T::one() / (self.re * self.re + T::one()).sqrt(),
+        )
     }
     #[inline]
     fn acosh(self) -> Self {
-	self.chain(self.re.acosh(), T::one() / (self.re * self.re - T::one()).sqrt())
+        self.chain(
+            self.re.acosh(),
+            T::one() / (self.re * self.re - T::one()).sqrt(),
+        )
     }
     #[inline]
     fn atanh(self) -> Self {
-	self.chain(self.re.atanh(), T::one() / (T::one() - self.re * self.re))
+        self.chain(self.re.atanh(), T::one() / (T::one() - self.re * self.re))
     }
 
     #[inline]
     fn log(self, base: Self::RealField) -> Self {
-	Dual::ln(self) / Dual::ln(base)
+        Dual::ln(self) / Dual::ln(base)
     }
     #[inline]
     fn log2(self) -> Self {
-	self.chain(self.re.log2(), T::one() / (self.re * T::ln_2()))
+        self.chain(self.re.log2(), T::one() / (self.re * T::ln_2()))
     }
     #[inline]
     fn log10(self) -> Self {
-	self.chain(self.re.log10(), T::one() / (self.re * T::ln_10()))
+        self.chain(self.re.log10(), T::one() / (self.re * T::ln_10()))
     }
     #[inline]
     fn ln(self) -> Self {
-	Dual::ln(self)
+        Dual::ln(self)
     }
     #[inline]
     fn ln_1p(self) -> Self {
-	self.chain(self.re.ln_1p(), T::one() / (T::one() + self.re))
+        self.chain(self.re.ln_1p(), T::one() / (T::one() + self.re))
     }
 
     #[inline]
     fn sqrt(self) -> Self {
-	Dual::sqrt(self)
+        Dual::sqrt(self)
     }
     #[inline]
     fn try_sqrt(self) -> Option<Self> {
-	if self.re >= T::zero() { Some(Dual::sqrt(self)) } else { None }
+        if self.re >= T::zero() {
+            Some(Dual::sqrt(self))
+        } else {
+            None
+        }
     }
     #[inline]
     fn cbrt(self) -> Self {
-	let c = self.re.cbrt();
-	let three = T::one() + T::one() + T::one();
-	self.chain(c, T::one() / (three * c * c))
+        let c = self.re.cbrt();
+        let three = T::one() + T::one() + T::one();
+        self.chain(c, T::one() / (three * c * c))
     }
 
     #[inline]
     fn exp(self) -> Self {
-	Dual::exp(self)
+        Dual::exp(self)
     }
     #[inline]
     fn exp2(self) -> Self {
-	let v = self.re.exp2();
-	self.chain(v, v * T::ln_2())
+        let v = self.re.exp2();
+        self.chain(v, v * T::ln_2())
     }
     #[inline]
     fn exp_m1(self) -> Self {
-	self.chain(self.re.exp_m1(), self.re.exp())
+        self.chain(self.re.exp_m1(), self.re.exp())
     }
 
     #[inline]
     fn powi(self, n: i32) -> Self {
-	Dual::powi(self, n)
+        Dual::powi(self, n)
     }
     #[inline]
     fn powf(self, n: Self::RealField) -> Self {
-	self.powf_dual(n)
+        self.powf_dual(n)
     }
     #[inline]
     fn powc(self, n: Self) -> Self {
-	self.powf_dual(n)
+        self.powf_dual(n)
     }
 
     #[inline]
     fn is_finite(&self) -> bool {
-	self.re.is_finite() && self.eps.iter().all(|e| e.is_finite())
+        self.re.is_finite() && self.eps.iter().all(|e| e.is_finite())
     }
 }
 
 impl<T: RealField + Copy, const N: usize> RealField for Dual<T, N> {
     #[inline]
     fn is_sign_positive(&self) -> bool {
-	self.re.is_sign_positive()
+        self.re.is_sign_positive()
     }
 
     #[inline]
     fn is_sign_negative(&self) -> bool {
-	self.re.is_sign_negative()
+        self.re.is_sign_negative()
     }
 
     #[inline]
     fn copysign(self, sign: Self) -> Self {
-	if sign.re.is_sign_positive() {
-	    self.abs()
-	} else {
-	    -self.abs()
-	}
+        if sign.re.is_sign_positive() {
+            self.abs()
+        } else {
+            -self.abs()
+        }
     }
 
     // max/min are selectors: decide on the value, return the chosen operand's
     // full dual (its derivative comes along; the other's is discarded).
     #[inline]
     fn max(self, other: Self) -> Self {
-	if other > self { other } else { self }
+        if other > self {
+            other
+        } else {
+            self
+        }
     }
 
     #[inline]
     fn min(self, other: Self) -> Self {
-	if other < self { other } else { self }
+        if other < self {
+            other
+        } else {
+            self
+        }
     }
 
     #[inline]
     fn clamp(self, min: Self, max: Self) -> Self {
-	if self < min {
-	    min
-	} else if self > max {
-	    max
-	} else {
-	    self
-	}
+        if self < min {
+            min
+        } else if self > max {
+            max
+        } else {
+            self
+        }
     }
 
     #[inline]
     fn atan2(self, other: Self) -> Self {
-	// self = y, other = x; d atan2(y, x) = (x dy - y dx) / (x^2 + y^2)
-	let denom = self.re * self.re + other.re * other.re;
-	let re = self.re.atan2(other.re);
-	let eps = (self.eps * other.re - other.eps * self.re) / denom;
-	Self::new(re, eps)
+        // self = y, other = x; d atan2(y, x) = (x dy - y dx) / (x^2 + y^2)
+        let denom = self.re * self.re + other.re * other.re;
+        let re = self.re.atan2(other.re);
+        let eps = (self.eps * other.re - other.eps * self.re) / denom;
+        Self::checked(re, eps)
     }
 
     #[inline]
     fn min_value() -> Option<Self> {
-	T::min_value().map(Self::from_re)
+        T::min_value().map(Self::from_re)
     }
 
     #[inline]
     fn max_value() -> Option<Self> {
-	T::max_value().map(Self::from_re)
+        T::max_value().map(Self::from_re)
     }
 
     #[inline]
     fn pi() -> Self {
-	Self::from_re(T::pi())
+        Self::from_re(T::pi())
     }
     #[inline]
     fn two_pi() -> Self {
-	Self::from_re(T::two_pi())
+        Self::from_re(T::two_pi())
     }
     #[inline]
     fn frac_pi_2() -> Self {
-	Self::from_re(T::frac_pi_2())
+        Self::from_re(T::frac_pi_2())
     }
     #[inline]
     fn frac_pi_3() -> Self {
-	Self::from_re(T::frac_pi_3())
+        Self::from_re(T::frac_pi_3())
     }
     #[inline]
     fn frac_pi_4() -> Self {
-	Self::from_re(T::frac_pi_4())
+        Self::from_re(T::frac_pi_4())
     }
     #[inline]
     fn frac_pi_6() -> Self {
-	Self::from_re(T::frac_pi_6())
+        Self::from_re(T::frac_pi_6())
     }
     #[inline]
     fn frac_pi_8() -> Self {
-	Self::from_re(T::frac_pi_8())
+        Self::from_re(T::frac_pi_8())
     }
     #[inline]
     fn frac_1_pi() -> Self {
-	Self::from_re(T::frac_1_pi())
+        Self::from_re(T::frac_1_pi())
     }
     #[inline]
     fn frac_2_pi() -> Self {
-	Self::from_re(T::frac_2_pi())
+        Self::from_re(T::frac_2_pi())
     }
     #[inline]
     fn frac_2_sqrt_pi() -> Self {
-	Self::from_re(T::frac_2_sqrt_pi())
+        Self::from_re(T::frac_2_sqrt_pi())
     }
     #[inline]
     fn e() -> Self {
-	Self::from_re(T::e())
+        Self::from_re(T::e())
     }
     #[inline]
     fn log2_e() -> Self {
-	Self::from_re(T::log2_e())
+        Self::from_re(T::log2_e())
     }
     #[inline]
     fn log10_e() -> Self {
-	Self::from_re(T::log10_e())
+        Self::from_re(T::log10_e())
     }
     #[inline]
     fn ln_2() -> Self {
-	Self::from_re(T::ln_2())
+        Self::from_re(T::ln_2())
     }
     #[inline]
     fn ln_10() -> Self {
-	Self::from_re(T::ln_10())
+        Self::from_re(T::ln_10())
     }
 }
 
@@ -997,12 +1063,58 @@ pub fn values<T: RealField + Copy, const N: usize, const M: usize>(
     SVector::from_fn(|i, _| y[i].re)
 }
 
+#[inline]
+pub fn dual_num<T: RealField + Copy>(re: T, eps: T) -> Dual<T> {
+    Dual::new(re, SVector::<T, 1>::new(eps))
+}
+
 /// The `M×N` Jacobian of an evaluated dual output (row `r` = ∂yᵣ/∂x).
 #[inline]
 pub fn jacobian<T: RealField + Copy, const N: usize, const M: usize>(
     y: &SVector<Dual<T, N>, M>,
 ) -> SMatrix<T, M, N> {
     SMatrix::from_fn(|r, c| y[r].eps[c])
+}
+
+pub fn jacobian_mut<F, T, const N: usize, const M: usize>(
+    f: &mut F,
+    x: &SVector<T, N>,
+    y: &mut SVector<T, M>,
+    jacobian: &mut SMatrix<T, M, N>,
+) where
+    T: RealField + Copy,
+    F: FnMut(&SVector<Dual<T, N>, N>, &mut SVector<Dual<T, N>, M>),
+{
+    let x_dual = seeded(x);
+    let mut y_dual = SVector::zeros();
+    f(&x_dual, &mut y_dual);
+    for r in 0..M {
+        y[r] = y_dual[r].re;
+        for c in 0..N {
+            jacobian[(r, c)] = y_dual[r].eps[c];
+        }
+    }
+}
+
+pub fn jvp_mut<F, T, const N: usize, const M: usize>(
+    f: &mut F,
+    x: &SVector<T, N>,
+    v: &SVector<T, N>,
+    y: &mut SVector<T, M>,
+    jvp: &mut SVector<T, M>,
+) where
+    T: RealField + Copy,
+    F: FnMut(&SVector<Dual<T>, N>, &mut SVector<Dual<T>, M>),
+{
+    let x_dual = SVector::from_fn(|r, _| dual_num(x[r], v[r]));
+    let mut y_dual = SVector::zeros();
+
+    f(&x_dual, &mut y_dual);
+
+    for i in 0..M {
+        y[i] = y_dual[i].re;
+        jvp[i] = y_dual[i].eps[0];
+    }
 }
 
 #[cfg(test)]
@@ -1038,7 +1150,12 @@ mod tests {
 
         let h = 1e-6;
         let fd = (sample(x + h) - sample(x - h)) / (2.0 * h);
-        assert!((dual.eps[0] - fd).abs() < 1e-6, "dual.eps = {}, fd = {}", dual.eps[0], fd);
+        assert!(
+            (dual.eps[0] - fd).abs() < 1e-6,
+            "dual.eps = {}, fd = {}",
+            dual.eps[0],
+            fd
+        );
     }
 
     #[test]
@@ -1110,5 +1227,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Second derivatives "for free" by nesting: `Dual<f64,1>` is itself a
+    // RealField, so `Dual<Dual<f64,1>,1>` type-checks and forward-over-forward
+    // yields f''. Distinct types keep the two tangent levels from mixing.
+    #[test]
+    fn nested_dual_gives_second_derivative() {
+        type D1 = Dual<f64, 1>;
+        type D2 = Dual<D1, 1>;
+
+        fn f<S: RealField + Copy>(x: S) -> S {
+            // x*sin(x): f' = sin x + x cos x,  f'' = 2 cos x - x sin x
+            x * x.sin()
+        }
+
+        let x0 = 0.7_f64;
+        // x = x0 + e1 + e2 : `re` carries (x0 + e1), `eps` carries coeff of e2 (=1).
+        let x = D2::new(
+            D1::new(x0, SVector::<f64, 1>::new(1.0)),
+            SVector::<D1, 1>::new(D1::new(1.0, SVector::<f64, 1>::new(0.0))),
+        );
+
+        let y = f(x);
+
+        let value = y.re.re;
+        let d1a = y.re.eps[0]; // d/de1
+        let d1b = y.eps[0].re; // d/de2
+        let d2 = y.eps[0].eps[0]; // d^2/de1 de2
+
+        let (s, c) = (x0.sin(), x0.cos());
+        assert!((value - x0 * s).abs() < EPS);
+        assert!((d1a - (s + x0 * c)).abs() < EPS); // f'
+        assert!((d1b - (s + x0 * c)).abs() < EPS); // f' again (the other tangent)
+        assert!((d2 - (2.0 * c - x0 * s)).abs() < EPS); // f''
+    }
+
+    // NaN policy: a derivative that does not exist — here ‖·‖ at the origin,
+    // where sqrt'(0) = 1/0 — is caught loudly by a debug assertion at the
+    // source op, never silently fabricated as a 0 sub-gradient. In release the
+    // assertion compiles out and the non-finite tangent propagates faithfully,
+    // so this check only applies to debug builds.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "non-finite derivative")]
+    fn singular_derivative_trips_debug_assertion() {
+        let _ = Dual::<f64, 1>::seed(0.0, 0).sqrt();
     }
 }
